@@ -8,64 +8,18 @@ from groq import Groq
 app = Flask(__name__)
 CORS(app)
 
-# Replace with your active Groq API Key if not set as an environment variable
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-client = Groq(api_key=GROQ_API_KEY)
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-def select_working_model(groq_client):
-    """Dynamically tests models on your account and picks the first active, non-reasoning chat model."""
-    try:
-        model_list = [m.id for m in groq_client.models.list().data]
-        print("\n================ AVAILABLE MODELS ON YOUR ACCOUNT ================")
-        for m in model_list:
-            print(f" -> {m}")
-        print("==================================================================\n")
-
-        # Exclude audio, vision, guard, rate-limited, and reasoning models
-        blocked_keywords = [
-            "whisper", "orpheus", "canopylabs", "guard", "vision", 
-            "embed", "120b", "deepseek", "r1", "reason", "thinking", "compound"
-        ]
-        
-        candidates = [m for m in model_list if not any(k in m.lower() for k in blocked_keywords)]
-
-        # Prioritize standard fast conversational models
-        candidates.sort(
-            key=lambda x: (
-                "llama-3.3" in x.lower() or "llama3" in x.lower(),
-                "gemma" in x.lower() or "mixtral" in x.lower(),
-                "8b" in x.lower() or "70b" in x.lower()
-            ),
-            reverse=True
-        )
-
-        for model_id in candidates:
-            try:
-                print(f"Testing model: {model_id} ...", end=" ")
-                groq_client.chat.completions.create(
-                    model=model_id,
-                    messages=[{"role": "user", "content": "hi"}],
-                    max_tokens=5
-                )
-                print("[READY]")
-                print(f"\n>>> ACTIVE CHAT MODEL SELECTED: {model_id}\n")
-                return model_id
-            except Exception as err:
-                print(f"[SKIPPED: {err}]")
-                continue
-
-    except Exception as e:
-        print(f"[Model Discovery Failed]: {e}")
-
-    return "llama-3.3-70b-versatile"
-
-ACTIVE_MODEL = select_working_model(client)
+PRIMARY_MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 SYSTEM_PROMPT = """
 You are an AI avatar representing Amartya BS in an interview for the AI Agent Team at 100x.
 Always respond in the first person ("I", "my", "me").
 Keep responses concise, clear, and natural for voice conversation (around 2 to 4 sentences per answer).
 Never invent experiences, skills, or metrics outside the provided resume context.
+Never output thinking tags, chain-of-thought, XML blocks, or markdown formatting (no asterisks, no hashes, no bullet points).
 
 === AMARTYA BS - RESUME CONTEXT ===
 Contact & Education:
@@ -104,14 +58,21 @@ Achievements & Certifications:
 - 1st Rank in Daisy Minds National Cyber Security Quiz.
 - Top-10 Finalist across multiple hackathons.
 - Certifications: Google Data Analytics, Google Cybersecurity, NPTEL Applied Accelerated AI, Python for Data Science (Elite).
-
-=== SAMPLE STAGE 1 BEHAVIORAL ANSWERS ===
-- Life Story: "I am a Computer Science graduate from East West Institute of Technology with an 8.4 CGPA. Over the past couple of years, my focus shifted heavily into Generative AI and autonomous agent workflows, having built production-grade document intelligence pipelines at L&T Technology Services and competitive ML platforms."
-- #1 Superpower: "My primary strength is execution speed with engineering pragmatism—taking complex AI research or modern LLM architectures and turning them into stable, low-latency, production-ready tools."
-- Top 3 Areas to Grow: "First, mastering multi-agent consensus and orchestrations using frameworks like LangGraph. Second, low-level inference optimization for open-weights models. Third, scaling distributed real-time voice architectures."
-- Coworker Misconception: "Colleagues sometimes perceive me as purely heads-down on code and architecture, but I actually rely heavily on cross-functional communication and fast iterative feedback loops."
-- Pushing Boundaries: "I push my boundaries by taking on end-to-end deployment challenges under tight constraints, whether it's building document parsing systems for 450+ enterprise specs or shipping live hackathon prototypes."
 """
+
+def sanitize_for_speech(text: str) -> str:
+    """Removes thinking tags, raw XML, and markdown symbols for natural TTS."""
+    if not text:
+        return ""
+    # Strip <think>...</think> tags and everything inside them
+    cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", text, flags=re.DOTALL)
+    # Strip any remaining XML/HTML tags
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    # Strip markdown symbols that shouldn't be read by TTS
+    cleaned = re.sub(r"[*_#`~>\[\]]", "", cleaned)
+    # Normalize whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 @app.route("/")
 def index():
@@ -127,8 +88,11 @@ def index():
 
 @app.route("/chat", methods=["POST"])
 def chat():
+    if not client:
+        return jsonify({"error": "GROQ_API_KEY environment variable is not configured."}), 500
+
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True) or {}
         user_message = data.get("message", "").strip()
 
         if not user_message:
@@ -136,24 +100,36 @@ def chat():
 
         print(f"[USER]: {user_message}")
 
-        completion = client.chat.completions.create(
-            model=ACTIVE_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=0.6,
-            max_tokens=350
-        )
+        # Try Primary Model (70B) first
+        try:
+            completion = client.chat.completions.create(
+                model=PRIMARY_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                temperature=0.5,
+                max_tokens=250
+            )
+            raw_reply = completion.choices[0].message.content or ""
+        except Exception as primary_err:
+            print(f"[Primary Model Failed, falling back]: {primary_err}")
+            completion = client.chat.completions.create(
+                model=FALLBACK_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                temperature=0.5,
+                max_tokens=250
+            )
+            raw_reply = completion.choices[0].message.content or ""
 
-        raw_reply = completion.choices[0].message.content or ""
-        
-        # Strip all think tags cleanly (both closed and unclosed)
-        clean_reply = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw_reply).strip()
-        reply = clean_reply if clean_reply else raw_reply.strip()
+        # Clean response
+        reply = sanitize_for_speech(raw_reply)
 
         if not reply:
-            reply = "I'm doing well, thank you! Ready to discuss my experience and projects for the 100x AI Agent Team."
+            reply = "I am ready to discuss my experience in AI and autonomous agent systems for the 100x assessment."
 
         print(f"[AGENT]: {reply}\n")
         return jsonify({"reply": reply})
