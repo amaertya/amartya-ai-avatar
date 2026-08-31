@@ -11,8 +11,14 @@ CORS(app)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-PRIMARY_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "llama-3.1-8b-instant"
+# Prioritized list of active conversational models (no reasoning/think tags)
+MODEL_CANDIDATES = [
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it"
+]
 
 SYSTEM_PROMPT = """
 You are an AI avatar representing Amartya BS in an interview for the AI Agent Team at 100x.
@@ -100,37 +106,36 @@ def chat():
 
         print(f"[USER]: {user_message}")
 
-        # Try Primary Model (70B) first
-        try:
-            completion = client.chat.completions.create(
-                model=PRIMARY_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.5,
-                max_tokens=250
-            )
-            raw_reply = completion.choices[0].message.content or ""
-        except Exception as primary_err:
-            print(f"[Primary Model Failed, falling back]: {primary_err}")
-            completion = client.chat.completions.create(
-                model=FALLBACK_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.5,
-                max_tokens=250
-            )
-            raw_reply = completion.choices[0].message.content or ""
+        raw_reply = None
+        last_error = None
 
-        # Clean response
+        # Failover loop: Tries each verified Groq model in order until successful
+        for model_id in MODEL_CANDIDATES:
+            try:
+                completion = client.chat.completions.create(
+                    model=model_id,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.5,
+                    max_tokens=250
+                )
+                raw_reply = completion.choices[0].message.content or ""
+                if raw_reply:
+                    print(f"[SUCCESS with model: {model_id}]")
+                    break
+            except Exception as err:
+                print(f"[Model {model_id} skipped]: {err}")
+                last_error = err
+                continue
+
+        if not raw_reply:
+            if last_error:
+                return jsonify({"error": f"LLM inference error: {str(last_error)}"}), 500
+            raw_reply = "I am ready to discuss my experience in AI and autonomous agent systems for the 100x assessment."
+
         reply = sanitize_for_speech(raw_reply)
-
-        if not reply:
-            reply = "I am ready to discuss my experience in AI and autonomous agent systems for the 100x assessment."
-
         print(f"[AGENT]: {reply}\n")
         return jsonify({"reply": reply})
 
